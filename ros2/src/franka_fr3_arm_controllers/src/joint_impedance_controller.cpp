@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <chrono>
 
 namespace franka_fr3_arm_controllers {
 namespace {
@@ -199,16 +200,14 @@ std::array<double, JointImpedanceController::kNumJoints> JointImpedanceControlle
 
 controller_interface::return_type JointImpedanceController::update(
     const rclcpp::Time& /*time*/, const rclcpp::Duration& /*period*/) {
-  // Make sure we're running sufficiently fast.
+  // Start total timing
+  auto start_total = std::chrono::high_resolution_clock::now();
+
+  // Measure jitter (time between update calls)
   rclcpp::Time current_time = this->get_node()->now();
   if (last_update_time_.seconds() != 0.0) {
-    rclcpp::Duration time_diff = current_time - last_update_time_;
-    if (time_diff.nanoseconds() > 20000000) {  // 20ms in nanoseconds
-      RCLCPP_WARN(get_node()->get_logger(),
-                  "Update loop took longer than 20ms. Delta: %f ms",
-                  time_diff.seconds() * 1000.0);
-    }
-    // REGISTER_ROS2_CONTROL_INTROSPECTION("time_diff", &time_diff);
+    double jitter_ms = (current_time - last_update_time_).seconds() * 1000.0;
+    jitter_stats_.update(jitter_ms);
   }
   last_update_time_ = current_time;
 
@@ -276,16 +275,28 @@ controller_interface::return_type JointImpedanceController::update(
   auto tau_d_saturated = saturateTorqueRate(controller_output, tau_J_d);
   std::copy(tau_d_saturated.begin(), tau_d_saturated.end(),
             last_torque_.begin());
-  // for (size_t i = 0; i < 7; ++i){
-  // }
 
   // Set command.
   for (size_t i = 0; i < kNumJoints; ++i) {
     command_interfaces_[i].set_value(tau_d_saturated[i]);
   }
 
-  // If in the future you'd like to publish the wrench torques:
-  // https://source.corp.google.com/h/deepmind-robotics/franka_ros/+/gdm-noetic-devel:gdm_robotics/src/dm_joint_position_controller.cpp;l=342
+  // End total timing
+  auto end_total = std::chrono::high_resolution_clock::now();
+  total_time_stats_.update(std::chrono::duration<double, std::milli>(end_total - start_total).count());
+
+  update_counter_++;
+  if (update_counter_ % 1000 == 0) {
+    RCLCPP_INFO(get_node()->get_logger(),
+                "Timing Stats (ms) [Min/Max/Avg]: "
+                "Compute: %.3f / %.3f / %.3f | "
+                "Jitter: %.3f / %.3f / %.3f",
+                total_time_stats_.min_ms, total_time_stats_.max_ms, total_time_stats_.avg(),
+                jitter_stats_.min_ms, jitter_stats_.max_ms, jitter_stats_.avg());
+    
+    total_time_stats_.reset();
+    jitter_stats_.reset();
+  }
 
   return controller_interface::return_type::OK;
 }

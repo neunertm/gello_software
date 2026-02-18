@@ -16,6 +16,7 @@
 
 #include <Eigen/Eigen>
 #include <array>
+#include <limits>
 #include "pid_controller.hpp"
 #include <memory>
 #include <string>
@@ -90,6 +91,33 @@ class JointImpedanceController
   const std::string k_robot_state_interface_name{"robot_state"};
   const std::string k_robot_model_interface_name{"robot_model"};
   gdm_robotics::PidController controller_;
+
+  struct TimingStats {
+    double min_ms = std::numeric_limits<double>::max();
+    double max_ms = 0.0;
+    double sum_ms = 0.0;
+    int count = 0;
+
+    void update(double ms) {
+      if (ms < min_ms) min_ms = ms;
+      if (ms > max_ms) max_ms = ms;
+      sum_ms += ms;
+      count++;
+    }
+
+    void reset() {
+      min_ms = std::numeric_limits<double>::max();
+      max_ms = 0.0;
+      sum_ms = 0.0;
+      count = 0;
+    }
+
+    double avg() const { return count > 0 ? sum_ms / count : 0.0; }
+  };
+
+  TimingStats total_time_stats_;
+  TimingStats jitter_stats_;
+  int update_counter_ = 0;
 };
 
 }  // namespace franka_fr3_arm_controllers
