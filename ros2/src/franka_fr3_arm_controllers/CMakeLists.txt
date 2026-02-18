@@ -31,6 +31,7 @@ find_package(controller_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(hardware_interface REQUIRED)
+find_package(realtime_tools REQUIRED)
 find_package(franka_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(franka_semantic_components REQUIRED)
@@ -41,7 +42,7 @@ add_library(
         ${PROJECT_NAME}
         SHARED
         src/joint_impedance_controller.cpp
-        src/motion_generator.cpp)
+        src/pid_controller.cpp)
 target_include_directories(
         ${PROJECT_NAME}
         PUBLIC
@@ -52,6 +53,7 @@ ament_target_dependencies(
         ${PROJECT_NAME}
         controller_interface
         hardware_interface
+        realtime_tools
         pluginlib
         rclcpp
         rclcpp_lifecycle
@@ -93,6 +95,7 @@ ament_export_dependencies(
         rclcpp
         rclcpp_lifecycle
         hardware_interface
+        realtime_tools
         moveit_core
 )
 

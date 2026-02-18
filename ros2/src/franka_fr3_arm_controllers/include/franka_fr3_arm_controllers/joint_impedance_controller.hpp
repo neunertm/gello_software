@@ -15,58 +15,81 @@
 #pragma once
 
 #include <Eigen/Eigen>
-#include <controller_interface/controller_interface.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/joint_state.hpp>
+#include <array>
+#include "pid_controller.hpp"
+#include <memory>
 #include <string>
-#include "franka_fr3_arm_controllers/motion_generator.hpp"
+#include <utility>
+#include <vector>
 
-using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+#include "controller_interface/controller_interface.hpp"
+#include "franka_semantic_components/franka_robot_model.hpp"
+#include "franka_semantic_components/franka_robot_state.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "realtime_tools/realtime_buffer.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
+
+using CallbackReturn =
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
 namespace franka_fr3_arm_controllers {
 
 /**
  * Controller to move the robot to a desired joint position.
  */
-class JointImpedanceController : public controller_interface::ControllerInterface {
+class JointImpedanceController
+    : public controller_interface::ControllerInterface {
  public:
-  using Vector7d = Eigen::Matrix<double, 7, 1>;
-  [[nodiscard]] controller_interface::InterfaceConfiguration command_interface_configuration()
-      const override;
-  [[nodiscard]] controller_interface::InterfaceConfiguration state_interface_configuration()
-      const override;
-  controller_interface::return_type update(const rclcpp::Time& time,
-                                           const rclcpp::Duration& period) override;
+  JointImpedanceController() : controller_(0.001) {}
+  static constexpr int kNumJoints = 7;
+  using Vector7d = Eigen::Matrix<double, kNumJoints, 1>;
+  [[nodiscard]] controller_interface::InterfaceConfiguration
+  command_interface_configuration() const override;
+  [[nodiscard]] controller_interface::InterfaceConfiguration
+  state_interface_configuration() const override;
+  controller_interface::return_type update(
+      const rclcpp::Time& time, const rclcpp::Duration& period) override;
   CallbackReturn on_init() override;
-  CallbackReturn on_configure(const rclcpp_lifecycle::State& previous_state) override;
-  CallbackReturn on_activate(const rclcpp_lifecycle::State& previous_state) override;
+  CallbackReturn on_configure(
+      const rclcpp_lifecycle::State& previous_state) override;
+  CallbackReturn on_activate(
+      const rclcpp_lifecycle::State& previous_state) override;
 
  private:
+  // Saturates the torque rate to respect torque derivative limits.
+  std::array<double, kNumJoints> saturateTorqueRate(
+      const std::array<double, kNumJoints>& tau_d_calculated,
+      const std::array<double, kNumJoints>& tau_J_d);
+  std::pair<std::array<double, kNumJoints>, std::array<double, kNumJoints>>
+  ComputeReferencePositionAndVelocity(const std::array<double, kNumJoints>& desired_position);
+  bool validateGains_(const std::vector<double>& gains,
+                      const std::string& gains_name);
+  void jointStateCallback_(const sensor_msgs::msg::JointState& msg);
+
   std::string arm_id_;
   std::string namespace_prefix_;
   std::string robot_description_;
-  const int num_joints = 7;
+  Vector7d last_position_;
+  Vector7d last_velocity_;
+  Vector7d last_torque_;
   Vector7d q_;
-  Vector7d dq_;
   Vector7d dq_filtered_;
-  Vector7d k_gains_;
-  Vector7d d_gains_;
-  double k_alpha_;
-  bool move_to_start_position_finished_{false};
-  bool motion_generator_initialized_{false};
-  rclcpp::Time start_time_;
-  std::unique_ptr<MotionGenerator> motion_generator_;
-  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_subscriber_ = nullptr;
-  bool gello_position_values_valid_ = false;
-  std::array<double, 7> gello_position_values_{0, 0, 0, 0, 0, 0, 0};
-  rclcpp::Time last_joint_state_time_;
+  Vector7d torque_derivative_limits_;
+  Vector7d acceleration_limits_;
+  double velocity_filter_alpha_;
+  double velocity_limits_scaling_;
 
-  Vector7d calculateTauDGains_(const Vector7d& q_goal);
-  bool validateGains_(const std::vector<double>& gains, const std::string& gains_name);
-  bool initializeMotionGenerator_();
-  void updateJointStates_();
-  void validateGelloPositions_(const sensor_msgs::msg::JointState& msg);
-  void jointStateCallback_(const sensor_msgs::msg::JointState msg);
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+      joint_state_subscriber_ = nullptr;
+  realtime_tools::RealtimeBuffer<std::array<double, kNumJoints>> desired_position_;
+  rclcpp::Time last_joint_state_time_;
+  rclcpp::Time last_update_time_;
+  std::unique_ptr<franka_semantic_components::FrankaRobotState> robot_state_;
+  std::unique_ptr<franka_semantic_components::FrankaRobotModel>
+      franka_robot_model_;
+  const std::string k_robot_state_interface_name{"robot_state"};
+  const std::string k_robot_model_interface_name{"robot_model"};
+  gdm_robotics::PidController controller_;
 };
 
 }  // namespace franka_fr3_arm_controllers
