@@ -25,11 +25,10 @@
 
 #include "controller_interface/controller_interface.hpp"
 #include "franka_semantic_components/franka_robot_model.hpp"
-#include "franka_semantic_components/franka_robot_state.hpp"
+#include "franka/robot_state.h"
 #include "rclcpp/rclcpp.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
-#include "franka_msgs/msg/franka_robot_state.hpp"
 
 using CallbackReturn =
     rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -70,7 +69,6 @@ class JointImpedanceController
 
   std::string arm_id_;
   std::string namespace_prefix_;
-  std::string robot_description_;
   Vector7d last_position_;
   Vector7d last_velocity_;
   Vector7d last_torque_;
@@ -85,11 +83,16 @@ class JointImpedanceController
   realtime_tools::RealtimeBuffer<std::array<double, kNumJoints>> desired_position_;
   rclcpp::Time last_joint_state_time_;
   rclcpp::Time last_update_time_;
-  std::unique_ptr<franka_semantic_components::FrankaRobotState> robot_state_;
+  // Direct pointer to franka::RobotState (from hardware interface)
+  franka::RobotState* robot_state_ptr_{nullptr};
   std::unique_ptr<franka_semantic_components::FrankaRobotModel>
       franka_robot_model_;
   const std::string k_robot_state_interface_name{"robot_state"};
   const std::string k_robot_model_interface_name{"robot_model"};
+  
+  // Indices for direct state interface access (position, velocity)
+  std::array<size_t, kNumJoints> joint_position_indices_;
+  std::array<size_t, kNumJoints> joint_velocity_indices_;
   gdm_robotics::PidController controller_;
 
   struct TimingStats {
@@ -120,7 +123,6 @@ class JointImpedanceController
   int update_counter_ = 0;
 
   // Pre-allocated memory for real-time safety
-  franka_msgs::msg::FrankaRobotState robot_state_msg_;
   std::array<double, kNumJoints> q_;
   std::array<double, kNumJoints> dq_filtered_;
   std::array<double, kNumJoints> pid_output_;

@@ -116,13 +116,6 @@ def generate_robot_nodes(context):
 
     nodes = [
         Node(
-            package="robot_state_publisher",
-            executable="robot_state_publisher",
-            namespace=namespace,
-            parameters=[{"robot_description": robot_description}],
-            output="screen",
-        ),
-        Node(
             package="controller_manager",
             executable="ros2_control_node",
             namespace=namespace,
@@ -141,34 +134,10 @@ def generate_robot_nodes(context):
             on_exit=Shutdown(),
         ),
         Node(
-            package="joint_state_publisher",
-            executable="joint_state_publisher",
-            name="joint_state_publisher",
-            namespace=namespace,
-            parameters=[
-                {
-                    "joints": joint_sources,
-                    "rate": joint_state_rate,
-                    "use_robot_description": False,
-                    "source_list": ["franka/joint_states", "franka_gripper/joint_states"],
-                }
-            ],
-            output="screen",
-        ),
-        Node(
             package="controller_manager",
             executable="spawner",
             namespace=namespace,
             arguments=["joint_state_broadcaster"],
-            output="screen",
-        ),
-        Node(
-            package="controller_manager",
-            executable="spawner",
-            namespace=namespace,
-            arguments=["franka_robot_state_broadcaster"],
-            parameters=[{"arm_id": LaunchConfiguration("arm_id").perform(context)}],
-            condition=UnlessCondition(LaunchConfiguration("use_fake_hardware")),
             output="screen",
         ),
         IncludeLaunchDescription(

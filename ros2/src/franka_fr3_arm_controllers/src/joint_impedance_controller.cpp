@@ -19,12 +19,28 @@
 #include <cassert>
 #include <cmath>
 #include <chrono>
+#include <cstring>
 
 #include <franka_msgs/srv/set_full_collision_behavior.hpp>
 
 namespace franka_fr3_arm_controllers {
 namespace {
 constexpr double kTimestepSeconds = 0.001;
+
+// bit_cast implementation (same as franka_ros2/franka_semantic_components)
+// See: https://en.cppreference.com/w/cpp/numeric/bit_cast
+template <class To, class From>
+std::enable_if_t<sizeof(To) == sizeof(From) && std::is_trivially_copyable<From>::value &&
+                     std::is_trivially_copyable<To>::value,
+                 To>
+bit_cast(const From& src) noexcept {
+  static_assert(std::is_trivially_constructible<To>::value,
+                "This implementation additionally requires "
+                "destination type to be trivially constructible");
+  To dst;
+  std::memcpy(&dst, &src, sizeof(To));
+  return dst;
+}
 
 // Function to calculate joint velocity limits
 std::pair<std::array<double, JointImpedanceController::kNumJoints>, std::array<double, JointImpedanceController::kNumJoints>>
@@ -109,10 +125,8 @@ JointImpedanceController::state_interface_configuration() const {
                            std::to_string(i) + "/effort");
   }
 
-  // Robot state.
-  for (const auto& name : robot_state_->get_state_interface_names()) {
-    config.names.push_back(name);
-  }
+  // Robot state (for direct pointer access to franka::RobotState).
+  config.names.push_back(arm_id_ + "/" + k_robot_state_interface_name);
 
   // Robot model.
   for (const auto& franka_robot_model_name :
@@ -128,11 +142,11 @@ JointImpedanceController::state_interface_configuration() const {
 
 std::pair<std::array<double, JointImpedanceController::kNumJoints>, std::array<double, JointImpedanceController::kNumJoints>>
 JointImpedanceController::ComputeReferencePositionAndVelocity(const std::array<double, JointImpedanceController::kNumJoints>& desired_position) {
+  auto velocity_limits = calculate_joint_velocity_limits(last_position_);
+
   for (size_t i = 0; i < kNumJoints; ++i) {
     // Calculate the current error.
     double distance_to_target = desired_position[i] - last_position_[i];
-
-    auto velocity_limits = calculate_joint_velocity_limits(last_position_);
 
     // Compute effective velocity that is scaled to satisfy acceleration limits.
     double min_velocity = std::max(
@@ -213,25 +227,18 @@ controller_interface::return_type JointImpedanceController::update(
   }
   last_update_time_ = current_time;
 
-  // Get the latest state.
-  robot_state_->initialize_robot_state_msg(robot_state_msg_);
-  if (!robot_state_->get_values_as_message(robot_state_msg_)) {
-    RCLCPP_ERROR(get_node()->get_logger(),
-                 "Failed to get robot state as message.");
-    return controller_interface::return_type::ERROR;
-  }
-
-  // Update desired position.
-  std::array<double, kNumJoints> desired_position = *desired_position_.readFromRT();
-
-  // Filter the measured velocity as it is a noisy signal.
+  // Read joint state via cached indices (faster than message conversion)
   for (size_t i = 0; i < kNumJoints; i++) {
+    q_[i] = state_interfaces_[joint_position_indices_[i]].get_value();
+    double dq_measured = state_interfaces_[joint_velocity_indices_[i]].get_value();
     dq_filtered_[i] = (1 - velocity_filter_alpha_) * dq_filtered_[i] +
-                      velocity_filter_alpha_ *
-                          robot_state_msg_.measured_joint_state.velocity[i];
+                      velocity_filter_alpha_ * dq_measured;
   }
 
   std::array<double, kNumJoints> controller_output;
+  // Update desired position from subscriber.
+  std::array<double, kNumJoints> desired_position = *desired_position_.readFromRT();
+
   // We currently support position setpoints. If we extend the interface to
   // support trajectories, we can call `SetTrajectoryReference`, providing
   // velocities and accelerations.
@@ -246,9 +253,7 @@ controller_interface::return_type JointImpedanceController::update(
                  "DMJointPositionController: Failed to set PID reference.");
   }
 
-  std::copy(robot_state_msg_.measured_joint_state.position.begin(),
-            robot_state_msg_.measured_joint_state.position.end(),
-            q_.begin());
+  // q_ is already updated above via cached indices.
   // dq_filtered_ is already updated in place above.
 
   status = controller_.ComputePIDOutput(q_, dq_filtered_, &pid_output_);
@@ -265,10 +270,10 @@ controller_interface::return_type JointImpedanceController::update(
     controller_output[i] += coriolis[i];
   }
 
-  // Apply torque rate saturation.
+  // Apply torque rate saturation using tau_J_d from robot state.
   std::array<double, kNumJoints> tau_J_d = {};
   for (size_t i = 0; i < kNumJoints; ++i) {
-    tau_J_d[i] = robot_state_msg_.desired_joint_state.effort[i];
+    tau_J_d[i] = robot_state_ptr_->tau_J_d[i];  // Direct access!
   }
   auto tau_d_saturated = saturateTorqueRate(controller_output, tau_J_d);
 
@@ -421,30 +426,15 @@ CallbackReturn JointImpedanceController::on_configure(
     namespace_prefix_ = namespace_prefix_.substr(1) + "_";
   }
 
-  // Robot model.
+  // Robot model (for coriolis and gravity).
   franka_robot_model_ =
       std::make_unique<franka_semantic_components::FrankaRobotModel>(
           franka_semantic_components::FrankaRobotModel(
               arm_id_ + "/" + k_robot_model_interface_name,
               arm_id_ + "/" + k_robot_state_interface_name));
 
-  // Robot description.
-  auto parameters_client = std::make_shared<rclcpp::AsyncParametersClient>(
-      get_node(), "robot_state_publisher");
-  parameters_client->wait_for_service();
-  auto future = parameters_client->get_parameters({"robot_description"});
-  auto result = future.get();
-  if (!result.empty()) {
-    robot_description_ = result[0].value_to_string();
-  } else {
-    RCLCPP_ERROR(get_node()->get_logger(),
-                 "Failed to get robot_description parameter.");
-  }
-
-  // Franka state.
-  robot_state_ = std::make_unique<franka_semantic_components::FrankaRobotState>(
-      franka_semantic_components::FrankaRobotState(
-          arm_id_ + "/" + k_robot_state_interface_name, robot_description_));
+  // Note: robot_state_ptr_ will be initialized in on_activate() via direct
+  // pointer access to the hardware interface's franka::RobotState.
 
   // Gains.
   auto p_gains = get_node()->get_parameter("p_gains").as_double_array();
@@ -602,32 +592,54 @@ CallbackReturn JointImpedanceController::on_activate(
   last_joint_state_time_ = get_node()->now();
   last_update_time_ = this->get_node()->now();
 
-  // Get the latest state.
-  robot_state_->assign_loaned_state_interfaces(state_interfaces_);
+  // Assign state interfaces to the robot model semantic component.
   franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
+
+  // Find and cache the robot_state pointer for direct access to tau_J_d.
+  // Uses the same bit_cast pattern as franka_semantic_components::FrankaRobotModel.
+  std::string robot_state_interface_name = arm_id_ + "/" + k_robot_state_interface_name;
+  auto franka_state_interface = std::find_if(
+      state_interfaces_.begin(), state_interfaces_.end(),
+      [&](const auto& interface) {
+        return interface.get_name() == robot_state_interface_name;
+      });
   
-  // Use member variable
-  robot_state_->initialize_robot_state_msg(robot_state_msg_);
-  if (!robot_state_->get_values_as_message(robot_state_msg_)) {
+  if (franka_state_interface != state_interfaces_.end()) {
+    robot_state_ptr_ = bit_cast<franka::RobotState*>(franka_state_interface->get_value());
+  } else {
     RCLCPP_ERROR(get_node()->get_logger(),
-                 "Failed to get robot state as message.");
+                 "Failed to find robot_state interface: %s",
+                 robot_state_interface_name.c_str());
     return CallbackReturn::ERROR;
   }
 
-  // Save the state.
+  // Cache indices for direct joint state access (faster than semantic component).
+  for (size_t i = 0; i < state_interfaces_.size(); ++i) {
+    const auto& name = state_interfaces_[i].get_name();
+    for (int j = 0; j < kNumJoints; ++j) {
+      std::string joint_name = arm_id_ + "_joint" + std::to_string(j + 1);
+      if (name.find(joint_name) != std::string::npos) {
+        if (name.find("/position") != std::string::npos) {
+          joint_position_indices_[j] = i;
+        } else if (name.find("/velocity") != std::string::npos) {
+          joint_velocity_indices_[j] = i;
+        }
+      }
+    }
+  }
+
+  // Read initial state via cached indices.
   std::array<double, kNumJoints> current_position;
   for (int i = 0; i < kNumJoints; ++i) {
-    current_position[i] = robot_state_msg_.measured_joint_state.position[i];
+    current_position[i] = state_interfaces_[joint_position_indices_[i]].get_value();
     last_position_[i] = current_position[i];
     last_velocity_[i] = 0.0;
-    last_torque_[i] = robot_state_msg_.desired_joint_state.effort[i];
+    last_torque_[i] = robot_state_ptr_->tau_J_d[i];
     dq_filtered_[i] = 0.0;
+    q_[i] = current_position[i];
   }
   desired_position_.initRT(current_position);
 
-  std::copy(robot_state_msg_.measured_joint_state.position.begin(),
-            robot_state_msg_.measured_joint_state.position.end(),
-            q_.begin());
   if (!controller_.Reset(q_)) {
     RCLCPP_ERROR(get_node()->get_logger(),
                  "DMJointPositionController: Failed to reset internal PID.");
@@ -644,7 +656,7 @@ bool JointImpedanceController::validateGains_(const std::vector<double>& gains,
     return false;
   }
 
-  if (gains.size() != static_cast<uint>(kNumJoints)) {
+  if (gains.size() != static_cast<size_t>(kNumJoints)) {
     RCLCPP_FATAL(get_node()->get_logger(),
                  "%s should be of size %d but is of size %ld",
                  gains_name.c_str(), kNumJoints, gains.size());
