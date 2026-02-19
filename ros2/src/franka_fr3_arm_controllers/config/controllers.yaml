@@ -11,8 +11,8 @@
       joint_state_broadcaster:
         type: joint_state_broadcaster/JointStateBroadcaster
 
-      franka_robot_state_broadcaster:
-        type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+      # franka_robot_state_broadcaster:
+      #   type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
 
 /**:
   joint_impedance_controller:
@@ -43,5 +43,19 @@
         - 0.0
       velocity_filter_alpha: 0.9  # Filters the velocity measured by the robot.
       velocity_limits_scaling: 0.9  # Scales the velocity limits by factor. Used to prevent joint velocity limits errors.
-      acceleration_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]  # Acceleration limits for each joint (rad/s^2)
+      acceleration_limits: [9.5, 9.5, 9.5, 9.5, 9.5, 9.5, 9.5]  # Acceleration limits for each joint (rad/s^2)
       torque_derivative_limits: [900.0, 900.0, 900.0, 900.0, 900.0, 900.0, 900.0]
+      # HW torque limits: [87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0]
+      torque_limits: [85.0, 85.0, 85.0, 85.0, 11.5, 11.5, 11.5]  # FR3 max torques per joint
+
+      # Collision behavior thresholds (set high to effectively disable collision detection)
+      # Joint collision thresholds (7 values, Nm)
+      lower_torque_thresholds_nominal: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      upper_torque_thresholds_nominal: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      lower_torque_thresholds_acceleration: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      upper_torque_thresholds_acceleration: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      # Cartesian collision thresholds (6 values: Fx, Fy, Fz, Tx, Ty, Tz)
+      lower_force_thresholds_nominal: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      upper_force_thresholds_nominal: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      lower_force_thresholds_acceleration: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0]
+      upper_force_thresholds_acceleration: [150.0, 150.0, 150.0, 150.0, 150.0, 150.0]

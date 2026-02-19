@@ -29,6 +29,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "realtime_tools/realtime_buffer.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
+#include "franka_msgs/msg/franka_robot_state.hpp"
 
 using CallbackReturn =
     rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -73,13 +74,12 @@ class JointImpedanceController
   Vector7d last_position_;
   Vector7d last_velocity_;
   Vector7d last_torque_;
-  Vector7d q_;
-  Vector7d dq_filtered_;
+
   Vector7d torque_derivative_limits_;
   Vector7d acceleration_limits_;
+  Vector7d torque_limits_;
   double velocity_filter_alpha_;
   double velocity_limits_scaling_;
-
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
       joint_state_subscriber_ = nullptr;
   realtime_tools::RealtimeBuffer<std::array<double, kNumJoints>> desired_position_;
@@ -118,6 +118,17 @@ class JointImpedanceController
   TimingStats total_time_stats_;
   TimingStats jitter_stats_;
   int update_counter_ = 0;
+
+  // Pre-allocated memory for real-time safety
+  franka_msgs::msg::FrankaRobotState robot_state_msg_;
+  std::array<double, kNumJoints> q_;
+  std::array<double, kNumJoints> dq_filtered_;
+  std::array<double, kNumJoints> pid_output_;
+  std::array<double, kNumJoints> ref_pos_;
+  std::array<double, kNumJoints> ref_vel_;
+  std::array<double, kNumJoints> null_acc_;
+
+
 };
 
 }  // namespace franka_fr3_arm_controllers

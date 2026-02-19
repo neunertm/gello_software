@@ -20,6 +20,8 @@
 #include <cmath>
 #include <chrono>
 
+#include <franka_msgs/srv/set_full_collision_behavior.hpp>
+
 namespace franka_fr3_arm_controllers {
 namespace {
 constexpr double kTimestepSeconds = 0.001;
@@ -126,11 +128,11 @@ JointImpedanceController::state_interface_configuration() const {
 
 std::pair<std::array<double, JointImpedanceController::kNumJoints>, std::array<double, JointImpedanceController::kNumJoints>>
 JointImpedanceController::ComputeReferencePositionAndVelocity(const std::array<double, JointImpedanceController::kNumJoints>& desired_position) {
-  auto velocity_limits = calculate_joint_velocity_limits(last_position_);
-
   for (size_t i = 0; i < kNumJoints; ++i) {
     // Calculate the current error.
     double distance_to_target = desired_position[i] - last_position_[i];
+
+    auto velocity_limits = calculate_joint_velocity_limits(last_position_);
 
     // Compute effective velocity that is scaled to satisfy acceleration limits.
     double min_velocity = std::max(
@@ -212,9 +214,6 @@ controller_interface::return_type JointImpedanceController::update(
   last_update_time_ = current_time;
 
   // Get the latest state.
-  // Get the latest state.
-  // robot_state_msg_ is a member variable, so we don't allocate here.
-  // initialize_robot_state_msg ensures the message structure is correct (resizing vectors if needed, but usually they stay same size)
   robot_state_->initialize_robot_state_msg(robot_state_msg_);
   if (!robot_state_->get_values_as_message(robot_state_msg_)) {
     RCLCPP_ERROR(get_node()->get_logger(),
@@ -225,7 +224,6 @@ controller_interface::return_type JointImpedanceController::update(
   // Update desired position.
   std::array<double, kNumJoints> desired_position = *desired_position_.readFromRT();
 
-  // Filter the measured velocity as it is a noisy signal.
   // Filter the measured velocity as it is a noisy signal.
   for (size_t i = 0; i < kNumJoints; i++) {
     dq_filtered_[i] = (1 - velocity_filter_alpha_) * dq_filtered_[i] +
@@ -267,12 +265,54 @@ controller_interface::return_type JointImpedanceController::update(
     controller_output[i] += coriolis[i];
   }
 
-  // Apply saturation.
+  // Apply torque rate saturation.
   std::array<double, kNumJoints> tau_J_d = {};
   for (size_t i = 0; i < kNumJoints; ++i) {
     tau_J_d[i] = robot_state_msg_.desired_joint_state.effort[i];
   }
   auto tau_d_saturated = saturateTorqueRate(controller_output, tau_J_d);
+
+  // Apply absolute torque limits.
+  // The robot adds gravity internally, so we need to account for that.
+  // Check 1: gravity + current_command should not exceed limits
+  // Check 2: tau_J_d + delta_tau should not exceed limits
+  std::array<double, kNumJoints> gravity =
+      franka_robot_model_->getGravityForceVector();
+
+  for (size_t i = 0; i < kNumJoints; ++i) {
+    // Check 1: Estimate total torque as command + gravity
+    double estimated_total_calculated = tau_d_saturated[i] + gravity[i];
+
+    // Check 2: Estimate total torque as tau_J_d + (command - last_command)
+    double delta_tau = tau_d_saturated[i] - last_torque_[i];
+    double estimated_total_measured = tau_J_d[i] + delta_tau;
+
+    // Use the more conservative (larger magnitude) estimate
+    double estimated_total = (
+      std::abs(estimated_total_calculated) > std::abs(estimated_total_measured))
+                                 ? estimated_total_calculated
+                                 : estimated_total_measured;
+
+    // Clamp to limits if needed - reduce/increase by the excess amount
+    if (estimated_total > torque_limits_[i]) {
+      double excess = estimated_total - torque_limits_[i];
+      tau_d_saturated[i] -= excess;
+      RCLCPP_WARN(get_node()->get_logger(),
+                  "Joint %zu: Clamping torque (over limit by %.2f Nm). "
+                  "estimated=%.2f, limit=%.2f, cmd: %.2f -> %.2f",
+                  i, excess, estimated_total, torque_limits_[i],
+                  tau_d_saturated[i] + excess, tau_d_saturated[i]);
+    } else if (estimated_total < -torque_limits_[i]) {
+      double excess = estimated_total + torque_limits_[i];
+      tau_d_saturated[i] -= excess;
+      RCLCPP_WARN(get_node()->get_logger(),
+                  "Joint %zu: Clamping torque (under limit by %.2f Nm). "
+                  "estimated=%.2f, limit=%.2f, cmd: %.2f -> %.2f",
+                  i, -excess, estimated_total, -torque_limits_[i],
+                  tau_d_saturated[i] + excess, tau_d_saturated[i]);
+    }
+  }
+
   std::copy(tau_d_saturated.begin(), tau_d_saturated.end(),
             last_torque_.begin());
 
@@ -318,7 +358,6 @@ void JointImpedanceController::jointStateCallback_(
             new_position.begin());
   desired_position_.writeFromNonRT(new_position);
 
-  validateGelloPositions_(msg);
   last_joint_state_time_ = msg.header.stamp;
 }
 
@@ -340,6 +379,27 @@ CallbackReturn JointImpedanceController::on_init() {
                                       std::vector<double>(kNumJoints, 0.0));
     auto_declare<std::vector<double>>("torque_derivative_limits",
                                       std::vector<double>(kNumJoints, 0.0));
+    // FR3 torque limits: joints 1-4 = 87 Nm, joints 5-7 = 12 Nm
+    auto_declare<std::vector<double>>("torque_limits",
+                                      std::vector<double>{87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0});
+
+    // Collision behavior parameters (defaults from franka_example_controllers)
+    auto_declare<std::vector<double>>("lower_torque_thresholds_nominal",
+                                      std::vector<double>{25.0, 25.0, 22.0, 20.0, 19.0, 17.0, 14.0});
+    auto_declare<std::vector<double>>("upper_torque_thresholds_nominal",
+                                      std::vector<double>{35.0, 35.0, 32.0, 30.0, 29.0, 27.0, 24.0});
+    auto_declare<std::vector<double>>("lower_torque_thresholds_acceleration",
+                                      std::vector<double>{25.0, 25.0, 22.0, 20.0, 19.0, 17.0, 14.0});
+    auto_declare<std::vector<double>>("upper_torque_thresholds_acceleration",
+                                      std::vector<double>{35.0, 35.0, 32.0, 30.0, 29.0, 27.0, 24.0});
+    auto_declare<std::vector<double>>("lower_force_thresholds_nominal",
+                                      std::vector<double>{30.0, 30.0, 30.0, 25.0, 25.0, 25.0});
+    auto_declare<std::vector<double>>("upper_force_thresholds_nominal",
+                                      std::vector<double>{40.0, 40.0, 40.0, 35.0, 35.0, 35.0});
+    auto_declare<std::vector<double>>("lower_force_thresholds_acceleration",
+                                      std::vector<double>{30.0, 30.0, 30.0, 25.0, 25.0, 25.0});
+    auto_declare<std::vector<double>>("upper_force_thresholds_acceleration",
+                                      std::vector<double>{40.0, 40.0, 40.0, 35.0, 35.0, 35.0});
   } catch (const std::exception& e) {
     fprintf(stderr, "Exception thrown during init stage with message: %s \n",
             e.what());
@@ -390,7 +450,6 @@ CallbackReturn JointImpedanceController::on_configure(
   auto p_gains = get_node()->get_parameter("p_gains").as_double_array();
   auto i_gains = get_node()->get_parameter("i_gains").as_double_array();
   auto d_gains = get_node()->get_parameter("d_gains").as_double_array();
-  auto k_alpha = get_node()->get_parameter("k_alpha").as_double();
 
   if (!validateGains_(p_gains, "p_gains") ||
       !validateGains_(i_gains, "i_gains") ||
@@ -431,6 +490,20 @@ CallbackReturn JointImpedanceController::on_configure(
     return CallbackReturn::FAILURE;
   }
 
+  // Torque limits (absolute limits per joint).
+  auto torque_limits =
+      get_node()->get_parameter("torque_limits").as_double_array();
+  if (torque_limits.size() == kNumJoints) {
+    std::copy(torque_limits.begin(), torque_limits.end(),
+              torque_limits_.begin());
+  } else {
+    RCLCPP_ERROR(
+        get_node()->get_logger(),
+        "torque_limits should be of size %d but is of size %ld",
+        kNumJoints, torque_limits.size());
+    return CallbackReturn::FAILURE;
+  }
+
   // Subscribes to the topic that publishes the commands for the robot.
   joint_state_subscriber_ =
       get_node()->create_subscription<sensor_msgs::msg::JointState>(
@@ -468,6 +541,58 @@ CallbackReturn JointImpedanceController::on_configure(
   // not be aware of the actual saturation.
 
   null_acc_.fill(0.0);
+
+  // Set collision behavior via service
+  auto collision_client = get_node()->create_client<franka_msgs::srv::SetFullCollisionBehavior>(
+      "service_server/set_full_collision_behavior");
+
+  auto request = std::make_shared<franka_msgs::srv::SetFullCollisionBehavior::Request>();
+
+  // Read collision thresholds from parameters
+  auto lower_torque_nominal = get_node()->get_parameter("lower_torque_thresholds_nominal").as_double_array();
+  auto upper_torque_nominal = get_node()->get_parameter("upper_torque_thresholds_nominal").as_double_array();
+  auto lower_torque_accel = get_node()->get_parameter("lower_torque_thresholds_acceleration").as_double_array();
+  auto upper_torque_accel = get_node()->get_parameter("upper_torque_thresholds_acceleration").as_double_array();
+  auto lower_force_nominal = get_node()->get_parameter("lower_force_thresholds_nominal").as_double_array();
+  auto upper_force_nominal = get_node()->get_parameter("upper_force_thresholds_nominal").as_double_array();
+  auto lower_force_accel = get_node()->get_parameter("lower_force_thresholds_acceleration").as_double_array();
+  auto upper_force_accel = get_node()->get_parameter("upper_force_thresholds_acceleration").as_double_array();
+
+  std::copy(lower_torque_nominal.begin(), lower_torque_nominal.end(),
+            request->lower_torque_thresholds_nominal.begin());
+  std::copy(upper_torque_nominal.begin(), upper_torque_nominal.end(),
+            request->upper_torque_thresholds_nominal.begin());
+  std::copy(lower_torque_accel.begin(), lower_torque_accel.end(),
+            request->lower_torque_thresholds_acceleration.begin());
+  std::copy(upper_torque_accel.begin(), upper_torque_accel.end(),
+            request->upper_torque_thresholds_acceleration.begin());
+  std::copy(lower_force_nominal.begin(), lower_force_nominal.end(),
+            request->lower_force_thresholds_nominal.begin());
+  std::copy(upper_force_nominal.begin(), upper_force_nominal.end(),
+            request->upper_force_thresholds_nominal.begin());
+  std::copy(lower_force_accel.begin(), lower_force_accel.end(),
+            request->lower_force_thresholds_acceleration.begin());
+  std::copy(upper_force_accel.begin(), upper_force_accel.end(),
+            request->upper_force_thresholds_acceleration.begin());
+
+  RCLCPP_INFO(get_node()->get_logger(), "Setting collision behavior...");
+  auto future_result = collision_client->async_send_request(request);
+
+  // Wait for the service response (1 second timeout)
+  if (future_result.wait_for(std::chrono::seconds(1)) == std::future_status::ready) {
+    auto result = future_result.get();
+    if (result->success) {
+      RCLCPP_INFO(get_node()->get_logger(), "Collision behavior set successfully.");
+    } else {
+      RCLCPP_ERROR(get_node()->get_logger(), "Failed to set collision behavior: %s",
+                   result->error.c_str());
+      return CallbackReturn::FAILURE;
+    }
+  } else {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Timeout waiting for set_full_collision_behavior service.");
+    return CallbackReturn::FAILURE;
+  }
 
   return CallbackReturn::SUCCESS;
 }
@@ -519,7 +644,7 @@ bool JointImpedanceController::validateGains_(const std::vector<double>& gains,
     return false;
   }
 
-  if (gains.size() != static_cast<size_t>(kNumJoints)) {
+  if (gains.size() != static_cast<uint>(kNumJoints)) {
     RCLCPP_FATAL(get_node()->get_logger(),
                  "%s should be of size %d but is of size %ld",
                  gains_name.c_str(), kNumJoints, gains.size());
